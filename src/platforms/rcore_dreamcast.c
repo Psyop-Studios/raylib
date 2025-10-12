@@ -64,6 +64,28 @@ typedef struct {
 } PlatformData;
 
 //----------------------------------------------------------------------------------
+// PVR Header FOR DREAMCAST 
+//----------------------------------------------------------------------------------
+// PVR Header structures
+typedef struct {
+    char id[4];           // "GBIX"
+    unsigned int size;    // Size of GBIX data
+    unsigned int globalIndex;
+    unsigned int padding;
+} GBIXHeader;
+
+typedef struct {
+    char id[4];           // "PVRT"
+    unsigned int dataSize;
+    unsigned char pixelFormat;
+    unsigned char dataType;
+    unsigned short reserved;
+    unsigned short width;
+    unsigned short height;
+} PVRTHeader;
+
+
+//----------------------------------------------------------------------------------
 // Global Variables Definition
 //----------------------------------------------------------------------------------
 extern CoreData CORE;                   // Global CORE state context
@@ -612,6 +634,278 @@ void PollInputEvents(void)
         // TODO: Poll input events for current plaform
         }
     }
+}
+
+//----------------------------------------------------------------------------------
+// PVR FUNCTIONS based on code by fabien sanglard but it will be transparent for final user using:
+// Image image = LoadImage("/rd/glass.pvr");            // Load pvr image from romdisk
+// Texture2D pvr = LoadTextureFromImage(image);       // load texture based on image (VRAM)
+//----------------------------------------------------------------------------------
+
+
+// Detwiddle function for square twiddled textures
+void Detwiddle(unsigned char *src, unsigned char *dst, int width, int height, int bpp)
+{
+    int bytesPerPixel = bpp / 8;
+    
+    for (int y = 0; y < height; y++)
+    {
+        for (int x = 0; x < width; x++)
+        {
+            int src_x = 0, src_y = 0;
+            int temp_x = x, temp_y = y;
+            
+            // Twiddle calculation
+            for (int bit = 0; bit < 10; bit++)
+            {
+                if (temp_x & (1 << bit)) src_x |= (1 << (bit * 2));
+                if (temp_y & (1 << bit)) src_y |= (1 << (bit * 2 + 1));
+            }
+            
+            int srcIndex = (src_x | src_y) * bytesPerPixel;
+            int dstIndex = (y * width + x) * bytesPerPixel;
+            
+            for (int b = 0; b < bytesPerPixel; b++)
+            {
+                dst[dstIndex + b] = src[srcIndex + b];
+            }
+        }
+    }
+}
+
+// Convert width/height from PVR format to actual pixels
+int ConvertDimension(unsigned short dim)
+{
+    if (dim == 0x0000) return 8;
+    if (dim == 0x0001) return 16;
+    if (dim == 0x0002) return 32;
+    if (dim == 0x0003) return 64;
+    if (dim == 0x0004) return 128;
+    if (dim == 0x0005) return 256;
+    if (dim == 0x0006) return 512;
+    if (dim == 0x0007) return 1024;
+    return dim; // fallback
+}
+
+// Load from memory pvr dreamcast format to call from rtextures 
+void *rl_load_pvr_dreamcast_from_memory(const unsigned char *file_data, unsigned int file_size, int *width, int *height, int *format, int *mips)
+{
+
+    void *image_data = NULL;        // Image data pointer
+
+    unsigned char *file_data_ptr = (unsigned char *)file_data;
+
+    int index = 0;
+
+    if (file_data_ptr != NULL)
+    {
+         // Check for optional GBIX header
+        char magic[4];
+        memcpy(magic, file_data_ptr, 4);
+    
+        if (memcmp(magic, "GBIX", 4) == 0)
+        {
+            // Skip GBIX header
+            unsigned int gbixSize;
+            index = index+4;
+            memcpy(&gbixSize, file_data_ptr+index,4);
+
+            index = index+4+gbixSize;
+        
+            // Read PVRT magic
+            memcpy(magic, file_data_ptr+index, 4);
+          
+        }
+    
+        if (memcmp(magic, "PVRT", 4) != 0)
+        {
+            TraceLog(LOG_ERROR, "Invalid PVR file (missing PVRT header)");
+            return image_data;
+        }
+    
+        // Read PVRT header
+        PVRTHeader *header=(PVRTHeader *)(file_data_ptr+index);
+        index = index+16;
+        
+        *width = ConvertDimension(header->width);
+        *height = ConvertDimension(header->height);
+        *mips = 1;
+
+        TraceLog(LOG_INFO, "PVR: %dx%d, PixFmt=0x%02X, DataType=0x%02X", 
+             *width, *height, header->pixelFormat, header->dataType);
+    
+        // Determine bytes per pixel and format
+        int bpp = 0;
+        int pixelFormat = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        bool needsDetwiddle = false;
+        bool hasCLUT = false;
+    
+        switch (header->pixelFormat)
+        {
+            case 0x00: // ARGB1555
+                bpp = 16;
+                // Must convert to RGBA8888 since raylib doesn't support ARGB1555
+                break;
+            case 0x01: // RGB565
+                bpp = 16;
+                pixelFormat = PIXELFORMAT_UNCOMPRESSED_R5G6B5;
+                break;
+            case 0x02: // ARGB4444
+                bpp = 16;
+                // Must convert to RGBA8888
+                break;
+            case 0x05: // 4-BIT
+                bpp = 4;
+                hasCLUT = true;
+                break;
+            case 0x06: // 8-BIT
+                bpp = 8;
+                hasCLUT = true;
+                break;
+            default:
+                TraceLog(LOG_ERROR, "Unsupported pixel format: 0x%02X", header->pixelFormat);
+                return image_data;
+        }
+
+        // Check if twiddled
+        if (header->dataType == 0x01 || header->dataType == 0x02 || 
+            header->dataType == 0x05 || header->dataType == 0x06 ||
+            header->dataType == 0x07 || header->dataType == 0x08 ||
+            header->dataType == 0x0D)
+        {
+            needsDetwiddle = true;
+        }
+        
+        unsigned char *clut = NULL;
+        unsigned char *imageData = NULL;
+        
+        // Read CLUT if needed
+        if (hasCLUT)
+        {
+            clut = (unsigned char *)malloc(1024);
+            memcpy(clut, file_data_ptr+index, 1024);
+            index = index + 1024;
+        }
+        
+        // Read image data
+        int imageSize = ((*width) * (*height) * bpp) / 8;
+        unsigned char *rawData = (unsigned char *)malloc(imageSize);
+        memcpy(rawData, file_data_ptr+index, imageSize);
+
+        // Detwiddle if necessary
+        if (needsDetwiddle)
+        {
+            unsigned char *detwiddled = (unsigned char *)malloc(imageSize);
+            Detwiddle(rawData, detwiddled, *width, *height, bpp);
+            free(rawData);
+            imageData = detwiddled;
+        }
+        else
+        {
+            imageData = rawData;
+        }
+        
+        // Convert indexed color to RGBA if using CLUT
+        // For paletted textures, ALWAYS convert to RGBA8888
+        if (hasCLUT && clut)
+        {
+            int pixelCount = (*width) * (*height);
+            unsigned char *rgbaData = (unsigned char *)malloc(pixelCount * 4);
+            
+            for (int i = 0; i < pixelCount; i++)
+            {
+                int index;
+                if (bpp == 4)
+                {
+                    // 4-bit: two pixels per byte
+                    index = (i % 2 == 0) ? (imageData[i/2] & 0x0F) : (imageData[i/2] >> 4);
+                }
+                else // 8-bit
+                {
+                    index = imageData[i];
+                }
+                
+                // CLUT entries are 16-bit ARGB1555 colors
+                unsigned short color = ((unsigned short *)clut)[index];
+                
+                // Dreamcast ARGB1555: bit 15=A, bits 14-10=R, bits 9-5=G, bits 4-0=B
+                unsigned char a = (color & 0x8000) ? 255 : 0;
+                unsigned char r = ((color >> 10) & 0x1F);
+                unsigned char g = ((color >> 5) & 0x1F);
+                unsigned char b = (color & 0x1F);
+                
+                // Scale 5-bit values (0-31) to 8-bit (0-255)
+                // Use (x << 3) | (x >> 2) for better color distribution
+                rgbaData[i*4 + 0] = (r << 3) | (r >> 2); // R
+                rgbaData[i*4 + 1] = (g << 3) | (g >> 2); // G
+                rgbaData[i*4 + 2] = (b << 3) | (b >> 2); // B
+                rgbaData[i*4 + 3] = a;                    // A
+            }
+            
+            free(imageData);
+            free(clut);
+            imageData = rgbaData;
+            pixelFormat = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        }
+        // Convert non-paletted ARGB1555 to RGBA8888
+        else if (header->pixelFormat == 0x00 && !hasCLUT)
+        {
+            int pixelCount = (*width) * (*height);
+            unsigned char *rgbaData = (unsigned char *)malloc(pixelCount * 4);
+            unsigned short *src = (unsigned short *)imageData;
+            
+            for (int i = 0; i < pixelCount; i++)
+            {
+                unsigned short color = src[i];
+                
+                unsigned char a = (color & 0x8000) ? 255 : 0;
+                unsigned char r = ((color >> 10) & 0x1F);
+                unsigned char g = ((color >> 5) & 0x1F);
+                unsigned char b = (color & 0x1F);
+                
+                rgbaData[i*4 + 0] = (r << 3) | (r >> 2);
+                rgbaData[i*4 + 1] = (g << 3) | (g >> 2);
+                rgbaData[i*4 + 2] = (b << 3) | (b >> 2);
+                rgbaData[i*4 + 3] = a;
+            }
+            
+            free(imageData);
+            imageData = rgbaData;
+            pixelFormat = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        }
+        // Convert ARGB4444 to RGBA8888
+        else if (header->pixelFormat == 0x02 && !hasCLUT)
+        {
+            int pixelCount = (*width) * (*height);
+            unsigned char *rgbaData = (unsigned char *)malloc(pixelCount * 4);
+            unsigned short *src = (unsigned short *)imageData;
+            
+            for (int i = 0; i < pixelCount; i++)
+            {
+                unsigned short color = src[i];
+                
+                unsigned char a = ((color >> 12) & 0xF);
+                unsigned char r = ((color >> 8) & 0xF);
+                unsigned char g = ((color >> 4) & 0xF);
+                unsigned char b = (color & 0xF);
+                
+                // Scale 4-bit to 8-bit
+                rgbaData[i*4 + 0] = (r << 4) | r;
+                rgbaData[i*4 + 1] = (g << 4) | g;
+                rgbaData[i*4 + 2] = (b << 4) | b;
+                rgbaData[i*4 + 3] = (a << 4) | a;
+            }
+            
+            free(imageData);
+            imageData = rgbaData;
+            pixelFormat = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        }
+        *format=pixelFormat;
+        image_data = imageData;
+    }
+    
+    return image_data;
+
 }
 
 //----------------------------------------------------------------------------------
